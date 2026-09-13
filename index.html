@@ -143,11 +143,6 @@
     color: #000000;
   }
 
-  #cast-btn:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-
   .track-select {
     display: none;
     align-items: center;
@@ -245,7 +240,7 @@
     <div class="player-bar">
       <div class="now-playing" id="now-playing">Select a channel to begin</div>
       <div class="track-select" id="track-select"></div>
-      <button id="cast-btn" disabled>CAST</button>
+      <button id="cast-btn">CAST</button>
     </div>
     <div class="stage">
       <video-js id="player" class="vjs-default-skin" controls preload="auto"></video-js>
@@ -509,6 +504,13 @@
     player.one('loadedmetadata', function() {
       if (token !== currentChannelToken) return;
 
+      // Some "live channel" HLS setups are actually a rolling window of
+      // VOD segments rather than strict live HLS, so they don't report
+      // duration as Infinity even though the content is genuinely
+      // advancing. Rather than trust duration(), watch whether the
+      // seekable window's far edge is actually moving forward in real
+      // time before applying any drift correction — that's true for a
+      // rolling/live window and false for a static, already-complete VOD.
       seekBehindLive();
 
       var lastEdge = null;
@@ -538,6 +540,9 @@
         lastEdge = liveEdge;
         lastCheck = now;
 
+        // Not (yet) confirmed as advancing, or it stalled out for a
+        // while (e.g. the channel briefly paused its feed) — leave
+        // playback alone rather than nudging it around blindly.
         if (!advancingConfirmed || staticStreak >= 3) {
           player.playbackRate(1);
           return;
@@ -598,6 +603,12 @@
     }
   }
 
+  // Many of these HLS streams carry two renditions of the video in the
+  // master playlist (e.g. a lower-bitrate "main" version and a much
+  // higher quality second one). Video.js's bundled HLS engine (VHS)
+  // exposes these as "representations" rather than as HTML videoTracks.
+  // This lets the viewer force a specific rendition, defaulting to the
+  // 2nd one (index 1) once VHS has parsed the manifest.
   function setupVideoTracks(token) {
     trackSelectEl.style.display = 'none';
     trackSelectEl.innerHTML = '';
@@ -615,56 +626,43 @@
     });
   }
 
+  // --- Cast button ---
+  // Always shown as a plain, clickable button regardless of whether a
+  // cast/AirPlay target is actually available. No availability checking,
+  // no disabling — clicking it just invokes whatever casting API the
+  // browser supports (or shows an alert if none exists).
   var castMode = 'none'; // 'remote' | 'airplay' | 'none'
   var castVideoEl = null;
-  var castWatchId = null;
   var castSyncTimer = null;
-  var castFallbackTimer = null;
 
   function teardownCast() {
     if (castSyncTimer) {
       clearInterval(castSyncTimer);
       castSyncTimer = null;
     }
-    if (castFallbackTimer) {
-      clearTimeout(castFallbackTimer);
-      castFallbackTimer = null;
-    }
     if (castVideoEl) {
       if (castMode === 'remote' && castVideoEl.remote) {
         castVideoEl.remote.removeEventListener('connecting', updateCastLabel);
         castVideoEl.remote.removeEventListener('connect', updateCastLabel);
         castVideoEl.remote.removeEventListener('disconnect', updateCastLabel);
-        if (castWatchId !== null && typeof castVideoEl.remote.cancelWatchAvailability === 'function') {
-          try { castVideoEl.remote.cancelWatchAvailability(castWatchId); } catch (e) { /* ignore */ }
-        }
       } else if (castMode === 'airplay') {
-        castVideoEl.removeEventListener('webkitplaybacktargetavailabilitychanged', onAirplayAvailability);
         castVideoEl.removeEventListener('webkitcurrentplaybacktargetiswirelesschanged', updateCastLabel);
       }
     }
     castMode = 'none';
     castVideoEl = null;
-    castWatchId = null;
-    castBtn.disabled = true;
     castBtn.classList.remove('casting');
     castBtn.textContent = 'CAST';
-  }
-
-  function onAirplayAvailability(e) {
-    castBtn.disabled = e.availability !== 'available';
   }
 
   function updateCastLabel() {
     if (!castVideoEl) return;
     if (castMode === 'remote') {
-      var state = castVideoEl.remote.state; 
-      console.log('[cast] updateCastLabel: remote.state =', state);
+      var state = castVideoEl.remote.state; // 'connected' | 'connecting' | 'disconnected'
       castBtn.textContent = state === 'connected' ? 'CASTING' : (state === 'connecting' ? 'CONNECTING…' : 'CAST');
       castBtn.classList.toggle('casting', state !== 'disconnected');
     } else if (castMode === 'airplay') {
       var wireless = !!castVideoEl.webkitCurrentPlaybackTargetIsWireless;
-      console.log('[cast] updateCastLabel: airplay wireless =', wireless);
       castBtn.textContent = wireless ? 'AIRPLAYING' : 'AIRPLAY';
       castBtn.classList.toggle('casting', wireless);
     }
@@ -674,106 +672,38 @@
     teardownCast();
     var tech = player.tech({ IWillNotUseThisInPlugins: true });
     var videoEl = tech && tech.el();
-    if (!videoEl) {
-      console.log('[cast] setupCast: no tech/video element yet, skipping');
-      return;
-    }
+    if (!videoEl) return;
     castVideoEl = videoEl;
-
-    console.log('[cast] setupCast: checking capabilities', {
-      hasRemote: !!videoEl.remote,
-      remotePromptIsFunction: !!(videoEl.remote && typeof videoEl.remote.prompt === 'function'),
-      hasWatchAvailability: !!(videoEl.remote && typeof videoEl.remote.watchAvailability === 'function'),
-      hasAirplayPicker: typeof videoEl.webkitShowPlaybackTargetPicker === 'function',
-      disableRemotePlayback: videoEl.disableRemotePlayback,
-      userAgent: navigator.userAgent
-    });
 
     if (videoEl.remote && typeof videoEl.remote.prompt === 'function') {
       castMode = 'remote';
       castBtn.textContent = 'CAST';
-      castBtn.disabled = true; 
-      console.log('[cast] using Remote Playback API mode');
 
-      videoEl.remote.addEventListener('connecting', function() {
-        console.log('[cast] event: connecting');
-        updateCastLabel();
-      });
-      videoEl.remote.addEventListener('connect', function() {
-        console.log('[cast] event: connect');
-        updateCastLabel();
-      });
-      videoEl.remote.addEventListener('disconnect', function() {
-        console.log('[cast] event: disconnect');
-        updateCastLabel();
-      });
-
-      var gotAvailabilitySignal = false;
-
-      if (typeof videoEl.remote.watchAvailability === 'function') {
-        try {
-          videoEl.remote.watchAvailability(function(available) {
-            console.log('[cast] watchAvailability callback fired, available =', available);
-            gotAvailabilitySignal = true;
-            castBtn.disabled = !available;
-          }).then(function(id) {
-            console.log('[cast] watchAvailability registered, watch id =', id);
-            castWatchId = id;
-          }).catch(function(err) {
-            console.warn('[cast] watchAvailability promise rejected:', err && err.message, err);
-            gotAvailabilitySignal = true;
-            castBtn.disabled = false;
-          });
-        } catch (e) {
-          console.warn('[cast] watchAvailability threw synchronously:', e && e.message, e);
-          gotAvailabilitySignal = true;
-          castBtn.disabled = false;
-        }
-      } else {
-        console.log('[cast] watchAvailability not supported, enabling button by default');
-        gotAvailabilitySignal = true;
-        castBtn.disabled = false;
-      }
-
-      castFallbackTimer = setTimeout(function() {
-        if (!gotAvailabilitySignal) {
-          console.log('[cast] no availability signal after 4s, enabling button anyway');
-          castBtn.disabled = false;
-        }
-      }, 4000);
+      videoEl.remote.addEventListener('connecting', updateCastLabel);
+      videoEl.remote.addEventListener('connect', updateCastLabel);
+      videoEl.remote.addEventListener('disconnect', updateCastLabel);
     } else if (typeof videoEl.webkitShowPlaybackTargetPicker === 'function') {
       castMode = 'airplay';
-      castBtn.disabled = false;
       castBtn.textContent = 'AIRPLAY';
-      console.log('[cast] using AirPlay mode');
-      videoEl.addEventListener('webkitplaybacktargetavailabilitychanged', function(e) {
-        console.log('[cast] AirPlay availability changed:', e.availability);
-        onAirplayAvailability(e);
-      });
-      videoEl.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', function() {
-        console.log('[cast] AirPlay wireless target changed:', videoEl.webkitCurrentPlaybackTargetIsWireless);
-        updateCastLabel();
-      });
+
+      videoEl.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', updateCastLabel);
     } else {
       castMode = 'none';
-      castBtn.disabled = true;
       castBtn.textContent = 'CAST';
-      console.log('[cast] no casting API available in this browser — button stays disabled');
     }
 
     if (castMode !== 'none') {
+      // Events aren't dispatched consistently across every Remote
+      // Playback / AirPlay implementation, so poll the underlying state
+      // too, to keep the label in sync.
       castSyncTimer = setInterval(updateCastLabel, 1500);
     }
   }
 
   castBtn.addEventListener('click', function() {
-    console.log('[cast] button clicked, mode =', castMode, 'disabled =', castBtn.disabled);
     if (!castVideoEl) return;
     if (castMode === 'remote') {
-      castVideoEl.remote.prompt().then(function() {
-        console.log('[cast] prompt() resolved');
-      }).catch(function(err) {
-        console.warn('[cast] prompt() rejected:', err && err.message, err);
+      castVideoEl.remote.prompt().catch(function(err) {
         alert('Casting is unavailable right now: ' + err.message);
       });
     } else if (castMode === 'airplay') {
